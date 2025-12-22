@@ -11,6 +11,15 @@ from google import genai as google_genai
 from groq import Groq
 from utils import process_groq_response, create_reasoning_system_prompt
 
+
+### new code by NK
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import logging
+
+### -----------------------------
+
 # Function to convert JSON to Markdown for display.    
 def json_to_markdown(threat_model, improvement_suggestions):
     markdown_output = "## Threat Model\n\n"
@@ -421,54 +430,180 @@ def get_threat_model_mistral(mistral_api_key, mistral_model, prompt):
 
     return response_content
 
+
+_ollama_session = requests.Session()
+_retry_strategy = Retry(total=1, backoff_factor=1,
+                        status_forcelist=[429, 500, 502, 503, 504],
+                        allowed_methods=["POST", "GET"])
+_adapter = HTTPAdapter(max_retries=_retry_strategy)
+_ollama_session.mount("http://", _adapter)
+_ollama_session.mount("https://", _adapter)
+
+
 # Function to get threat model from Ollama hosted LLM.
-def get_threat_model_ollama(ollama_endpoint, ollama_model, prompt):
+def get_threat_model_ollama(ollama_endpoint, ollama_model, prompt, read_timeout=300):
     """
-    Get threat model from Ollama hosted LLM.
+    Robust Ollama call:
+      - Reuses a session with retries
+      - Uses a connect timeout of 5s and a configurable read timeout (default 300s)
+      - Parses Ollama's varied response shapes safely and returns a Python dict
+      - Returns a fallback structured response on parse/network errors (so UI stays stable)
+    """
+    logger = logging.getLogger(__name__)
     
-    Args:
-        ollama_endpoint (str): The URL of the Ollama endpoint (e.g., 'http://localhost:11434')
-        ollama_model (str): The name of the model to use
-        prompt (str): The prompt to send to the model
-        
-    Returns:
-        dict: The parsed JSON response from the model
-        
-    Raises:
-        requests.exceptions.RequestException: If there's an error communicating with the Ollama endpoint
-        json.JSONDecodeError: If the response cannot be parsed as JSON
-    """
+    logger.info("==== Inside Ollama threat model function ====")
+
     if not ollama_endpoint.endswith('/'):
         ollama_endpoint = ollama_endpoint + '/'
-    
+
     url = ollama_endpoint + "api/generate"
+    #system_prompt = "You are a helpful assistant designed to output JSON."
+    #full_prompt = f"{system_prompt}\n\n{prompt}"
+    
+    full_prompt = f"""
+        You MUST respond ONLY with valid JSON.
+        No explanations. No text outside the JSON. No markdown. No commentary.
 
-    system_prompt = "You are a helpful assistant designed to output JSON."
-    full_prompt = f"{system_prompt}\n\n{prompt}"
+        Your JSON MUST strictly match this structure:
 
+        {{
+        "threat_model": [
+            {{
+            "Threat Type": "<string>",
+            "Scenario": "<string>",
+            "Potential Impact": "<string>"
+            }}
+        ],
+        "improvement_suggestions": ["<string>", "<string>"]
+        }}
+
+        Now generate the JSON ONLY for the following application description:
+
+        {prompt}
+        """.strip()
+
+    logger.info(f"==== Full-Prompt ==== : {full_prompt}")
+    
     data = {
         "model": ollama_model,
         "prompt": full_prompt,
-        "stream": False,
-        "format": "json"
+        "stream": False
     }
 
     try:
-        response = requests.post(url, json=data, timeout=60)  # Add timeout
-        response.raise_for_status()  # Raise exception for bad status codes
-        outer_json = response.json()
-        
+        resp = _ollama_session.post(url, json=data, timeout=(5, read_timeout))
+        logger.info(f"==== response ==== : {resp.text}")
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        # Network / timeout errors: log useful info and return a fallback object
+        logger.exception("Ollama request failed")
+        return {
+            "threat_model": [
+                {
+                    "Threat Type": "Error",
+                    "Scenario": "Network/Request error contacting Ollama",
+                    "Potential Impact": f"Request failed: {str(e)}"
+                }
+            ],
+            "improvement_suggestions": [
+                "Check that Ollama is running and reachable at the configured endpoint.",
+                "Increase client read timeout if models take long to generate.",
+                "Inspect Ollama server logs for possible model OOM or crashing."
+            ]
+        }
+
+    # Try parse JSON from response
+    try:
+        outer_json = resp.json()
+    except ValueError:
+        # Not JSON — return helpful fallback including snippet of raw text
+        raw = resp.text[:1000]
+        logger.error("Ollama returned non-JSON response: %s", raw)
+        return {
+            "threat_model": [
+                {
+                    "Threat Type": "Error",
+                    "Scenario": "Non-JSON response from Ollama",
+                    "Potential Impact": "Unable to parse response from model"
+                }
+            ],
+            "improvement_suggestions": [
+                f"Raw response (truncated): {raw!s}",
+                "Check Ollama server output for errors or unexpected text surrounding JSON."
+            ]
+        }
+
+    # If the model directly returned the final JSON object (best case)
+    if isinstance(outer_json, dict) and "threat_model" in outer_json and "improvement_suggestions" in outer_json:
+        return outer_json
+
+    # If the payload contains a 'response' field, try to parse that
+    resp_field = outer_json.get("response") if isinstance(outer_json, dict) else None
+
+    # If it's already a dict, return it
+    if isinstance(resp_field, dict):
+        return resp_field
+
+    # If it's a string, try direct JSON parse then patchy extraction
+    if isinstance(resp_field, str):
         try:
-            # Parse the JSON response from the model's response field
-            inner_json = json.loads(outer_json['response'])
-            return inner_json
-        except (json.JSONDecodeError, KeyError):
+            parsed = json.loads(resp_field)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            # fallback: try to extract {...} substring
+            match = re.search(r'(\{.*\})', resp_field, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(1))
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
 
-            raise
-            
-    except requests.exceptions.RequestException:
+        # If we couldn't parse, log and return structured fallback
+        logger.error("Failed to parse JSON inside 'response'. Raw (truncated): %s", resp_field[:1000])
+        return {
+            "threat_model": [
+                {
+                    "Threat Type": "Error",
+                    "Scenario": "Unparseable JSON inside Ollama response",
+                    "Potential Impact": "Model returned text that could not be parsed as JSON"
+                }
+            ],
+            "improvement_suggestions": [
+                "Try re-running the request (sometimes model output is slightly malformed).",
+                "Consider using streaming mode to receive incremental output.",
+                f"Raw response snippet: {resp_field[:400]!s}"
+            ]
+        }
 
-        raise
+    # Last-resort attempts: check common wrapper keys
+    # (choices -> choices[0].message.content) etc.
+    try_keys = ("choices", "result", "output")
+    for key in try_keys:
+        if key in outer_json:
+            candidate = outer_json[key]
+            if isinstance(candidate, list) and candidate:
+                first = candidate[0]
+                if isinstance(first, dict):
+                    # try message.content
+                    message = first.get("message") or first.get("content") or first
+                    if isinstance(message, dict):
+                        content = message.get("content") or message.get("text")
+                        if isinstance(content, str):
+                            try:
+                                parsed = json.loads(content)
+                                if isinstance(parsed, dict):
+                                    return parsed
+                            except Exception:
+                                pass
+
+    # If nothing matched, return outer_json and let caller inspect it
+    logger.warning("Falling back to returning outer_json (unverified shape). Keys: %s", list(outer_json.keys()) if isinstance(outer_json, dict) else type(outer_json))
+    return outer_json
+
+
 
 # Function to get threat model from the Claude response.
 def get_threat_model_anthropic(anthropic_api_key, anthropic_model, prompt):
